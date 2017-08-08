@@ -2,32 +2,32 @@
 from __future__ import print_function, absolute_import, division
 
 from ast import literal_eval
-from errno import EACCES, ENODATA, ENOENT
+from errno import *
 from fusepy import FUSE, FuseOSError, Operations
 import os
 from sys import argv, exit
 from xattr import xattr
 
+def notsup():
+    raise FuseOSError(ENOTSUP)
+
 def base(path):
     return path.split('/')[-1]
 
-def local(path):
+def real(path):
     return './' + base(path)
 
 def set_tags_xattr(path, tags):
     xattr(path).set('user.tags', ','.join(tags).encode('utf-8'))
 
-def tags_path(path, isTag):
+def path2tags(path):
     comps = path.rstrip('/').split('/')
-    if isTag:
-       return set(comps[1:])
-    else:
-       return set(comps[1:-1])
+    return set(comps[1:-1])
     
-def tags_xattr(path):
+def xattr2tags(path):
     try:
-        tags = [tag.decode('utf-8') for tag in xattr(path).get('user.tags').split(',')]
-        if tags == ['']:
+        tags = {tag.decode('utf-8') for tag in xattr(path).get('user.tags').split(',')}
+        if tags == {''}:
             return set()
         return tags
     except IOError:
@@ -39,7 +39,6 @@ def stat(path):
     return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
         'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
 
-
 class Tagfs(Operations):
     def __init__(self, root_fd):
         self.root_fd = root_fd # should only be used by `init`, which closes it
@@ -47,9 +46,21 @@ class Tagfs(Operations):
 
     def __call__(self, op, path, *args):
         try:
-            return super(Tagfs, self).__call__(op, '.' + path, *args)
+            return super(Tagfs, self).__call__(op, path, *args)
         except EnvironmentError as err:
             raise FuseOSError(err.errno)
+
+    def tags_operation(self, path, files_fn, tags_fn=notsup):
+        tags = self.tags if (base(path) in self.tags) else xattr2tags(real(path))
+        if not path2tags(path).issubset(tags):
+            raise FuseOSError(ENOENT)
+        if base(path) in self.tags:
+            return tags_fn()
+        else:
+            return files_fn()
+
+    def update_fs_xattr(self):
+        xattr('.').set('user.tagfs.tags', str(self.tags))
 
     def init(self, path):
         os.fchdir(self.root_fd)
@@ -69,74 +80,123 @@ class Tagfs(Operations):
             return os.fsync(fh)
 
     def access(self, path, mode):
-        if not (tags_path(path, True).issubset(self.tags.keys()) or         # tags
-                tags_path(path, False).issubset(tags_xattr(local(path)))):  # files
-            raise FuseOSError(ENOENT)
-        if not os.access(local(path), mode):
-            raise FuseOSError(EACCES)
+        def files():
+            if not os.access(real(path), mode):
+                raise FuseOSError(EACCES)
+        def tags(): pass
+        self.tags_operation(path, files, tags)            
 
     def getattr(self, path, fh=None):
         if path == './':
-            return stat(local(path))
-        if (tags_path(path, True).issubset(self.tags.keys())):
-            return self.tags[base(path)]
-        if not tags_path(path, False).issubset(tags_xattr(local(path))):
-            raise FuseOSError(ENOENT)
-        return stat(local(path))
+            return stat('.')
+        def files(): return stat(real(path))
+        def tags():  return self.tags[base(path)]
+        return self.tags_operation(path, files, tags)
 
-    chmod = os.chmod
+    def chmod(self, path, mode):
+        def files(): os.chmod(real(path), mode)
+        self.tags_operation(path, files)
 
-    chown = os.chown
+    def chown(self, path, uid, gid):
+        def files(): os.chown(real(path), uid, gid)
+        self.tags_operation(path, files)
     
-    readlink = os.readlink
+    def readlink(self, path):
+        def files(): return os.readlink(real(path))
+        return self.tags_operation(path, files)
 
-    mknod = os.mknod
+    def mknod(self, path, mode, dev):
+        def files(): os.mknod(real(path), mode, dev)
+        self.tags_operation(path, files)
 
     def mkdir(self, path, mode):
-        os.mkdir(local(path), mode) # let the os generate a stat for us
-        self.tags[base(path)] = stat(local(path))
-        xattr('.').set('user.tagfs.tags', str(self.tags))
-        os.rmdir(local(path))
+        if not path2tags(path).issubset(self.tags):
+            raise FuseOSError(ENOENT)
+        os.mkdir(real(path), mode) # let the os generate a stat for us
+        self.tags[base(path)] = stat(real(path))
+        os.rmdir(real(path))
+        self.update_fs_xattr()
 
-    rmdir = os.rmdir
+    def rmdir(self, path):
+        def files(): os.rmdir(real(path)) # this will result in the correct error (ENOENT/ENOTDIR)
+        def tags():
+            if any(base(path) in xattr2tags('./' + filename) for filename in os.listdir('.')):
+                raise FuseOSError(ENOTEMPTY)
+            else:
+                del self.tags[base(path)]
+                self.update_fs_xattr()
+        self.tags_operation(path, files, tags)
 
     def readdir(self, path, fh):
-        tags = tags_path(path, True)
-        return ['.', '..'] + list(set(self.tags.keys()) - tags) + [
+        if path == '/':
+            tags = set()
+        else:
+            tags = path2tags(path) | {base(path)}
+        return ['.', '..'] + list(set(self.tags) - tags) + [
             filename.decode('utf-8') for filename in os.listdir('.')
-                if tags.issubset(tags_xattr('./' + filename))]
+                if tags.issubset(xattr2tags('./' + filename))]
 
-    def link(self, target, source):
-        return os.link(source, target)
+    def link(self, link, source):
+        def files():
+            os.link(real(source), real(link))
+            set_tags_xattr(real(link), path2tags(link))
+        def tags(): raise FuseOSError(EPERM)
+        self.tags_operation(source, files, tags)
 
-    unlink = os.unlink
+    def unlink(self, path):
+        def files(): os.unlink(real(source))
+        def tags():  raise FuseOSError(EISDIR)
+        self.tags_operation(path, files, tags)
 
-    def symlink(self, target, source):
-        return os.symlink(source, target)
+    def symlink(self, link, source):
+        if link != "" and source != "" and path2tags(link).issubset(xattr2tags(real(link))):
+            if base(link) in self.tags:
+                raise FuseOSError(EEXIST)
+            else:
+                os.symlink(source, real(link))
+                set_tags_xattr(real(link), path2tags(link))
+        else:
+            raise FuseOSError(ENOENT)
 
     def rename(self, old, new):
-        if not tags_path(old, False).issubset(tags_xattr(local(old))):
-            raise FuseOSError(ENOENT)
-        return set_tags_xattr(local(old), tags_path(new, False)) # TODO should handle new file names too, not just tags modification
+        def files():
+            os.rename(real(old), real(new))
+            to_remove = path2tags(old) - path2tags(new)
+            to_add    = path2tags(new) - path2tags(old)
+            tags = (xattr2tags(real(new)) - to_remove) | to_add
+            set_tags_xattr(real(new), tags)
+        def tags(): self.tags[base(new)] = self.tags.pop(base(old))
+        self.tags_operation(old, files, tags)
 
     def listxattr(self, path):
-        return xattr(path).list()
+        def files(): return xattr(real(path)).list()
+        return self.tags_operation(path, files)
 
     def getxattr(self, path, name):
-        return xattr(path).get(name)
+        def files(): return xattr(real(path)).get(name)
+        return self.tags_operation(path, files)
 
     def setxattr(self, path, name, value, options):
-        xattr(path).set(name, value, options)
+        def files(): xattr(real(path)).set(name, value, options)
+        self.tags_operation(path, files)
 
     def removexattr(self, path, name):
-        xattr(path).remove(name)
+        def files(): xattr(real(path)).remove(name)
+        self.tags_operation(path, files)
 
-    utimens = os.utime
+    def utimens(self, path, times):
+        def files(): os.utime(real(path), times)
+        return self.tags_operation(path, files)
 
-    open = os.open
+    def open(self, path, flags):
+        def files(): return os.open(real(path), flags)
+        def tags():  raise FuseOSError(EPERM)
+        return self.tags_operation(path, files, tags)
 
     def create(self, path, mode):
-        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        def files(): return os.open(real(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        def tags():  raise FuseOSError(EEXIST)
+        return self.tags_operation(path, files, tags)
 
     def read(self, path, size, offset, fh):
         os.lseek(fh, offset, 0)
@@ -147,8 +207,11 @@ class Tagfs(Operations):
         return os.write(fh, data)
 
     def truncate(self, path, length, fh=None):
-        with open(path, 'r+') as f:
-            f.truncate(length)
+        def files():
+            with open(real(path), 'r+') as f:
+                f.truncate(length)
+        def tags(): raise FuseOSError(EISDIR)
+        return self.tags_operation(path, files, tags)
 
     def flush(self, path, fh):
         return os.fsync(fh)
@@ -162,8 +225,6 @@ if __name__ == '__main__':
         print('usage: %s <root>' % argv[0])
         exit(1)
 
-    # we CAN actually write to the directory (e.g., creating a new dir in it),
-    # we use O_RDONLY just to work around python not allowing to open dirs with O_RDWR
     root_fd = os.open(os.path.realpath(argv[1]), os.O_RDONLY)
     fuse = FUSE(Tagfs(root_fd), argv[1], fsname='tagfs',
                 foreground=True, nothreads=True, nonempty=True, allow_other=True, debug=True)
