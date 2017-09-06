@@ -39,14 +39,14 @@ def stat(path):
     return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
         'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
 
-class Tagfs(Operations):
+class Atfs(Operations):
     def __init__(self, root_fd):
         self.root_fd = root_fd # should only be used by `init`, which closes it
         self.tags = {}
 
     def __call__(self, op, path, *args):
         try:
-            return super(Tagfs, self).__call__(op, path, *args)
+            return super(Atfs, self).__call__(op, path, *args)
         except EnvironmentError as err:
             raise FuseOSError(err.errno)
 
@@ -60,12 +60,12 @@ class Tagfs(Operations):
             return files_fn()
 
     def update_fs_xattr(self):
-        xattr('.').set('user.tagfs.tags', str(self.tags))
+        xattr('.').set('user.atfs.tags', str(self.tags))
 
     def init(self, path):
         os.fchdir(self.root_fd)
         os.close(self.root_fd)
-        self.tags = literal_eval(xattr('.').get('user.tagfs.tags'))
+        self.tags = literal_eval(xattr('.').get('user.atfs.tags'))
 
     def statfs(self, path):
         stv = os.statvfs('./')
@@ -226,5 +226,5 @@ if __name__ == '__main__':
         exit(1)
 
     root_fd = os.open(os.path.realpath(argv[1]), os.O_RDONLY)
-    fuse = FUSE(Tagfs(root_fd), argv[1], fsname='tagfs',
+    fuse = FUSE(Atfs(root_fd), argv[1], fsname='atfs',
                 foreground=True, nothreads=True, nonempty=True, allow_other=True, debug=True)
